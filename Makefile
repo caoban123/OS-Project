@@ -86,6 +86,8 @@ OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 
 CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -gdwarf-2
+CFLAGS += -march=rv64g
+ASFLAGS = -march=rv64g
 
 ifdef LAB
 LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
@@ -202,7 +204,8 @@ ifeq ($(LAB),syscall)
 UPROGS += \
 	$U/_attack\
 	$U/_attacktest\
-	$U/_secret
+	$U/_secret\
+	$U/_trace
 endif
 
 ifeq ($(LAB),lock)
