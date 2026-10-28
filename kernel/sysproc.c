@@ -102,84 +102,11 @@ sys_sysinfo(void)
 
   argaddr(0, &addr);
 
-  // Validate the entire user buffer before writing anything.
+  // Check bounds first; copyout also checks page mappings and permissions.
   // This also prevents unsigned address wraparound.
   if(addr >= p->sz ||
      sizeof(struct sysinfo) > p->sz - addr)
     return -1;
 
-  int nfiles = 0;
-  int nprocs = 0;
-
-  struct sysinfo_file file_info;
-  struct sysinfo_proc proc_info;
-
-  // Collect system-wide open file objects.
-  for(int i = 0; i < NFILE; i++){
-    memset(&file_info, 0, sizeof(file_info));
-
-    int result = get_open_file(i, &file_info);
-
-    if(result < 0)
-      return -1;
-
-    if(result == 0)
-      continue;
-
-    if(nfiles >= NFILE)
-      return -1;
-
-    get_file_pids(i, &file_info);
-
-    uint64 dst = addr
-      + __builtin_offsetof(struct sysinfo, files)
-      + (uint64)nfiles * sizeof(struct sysinfo_file);
-
-    if(copyout(p->pagetable, dst,
-               (char *)&file_info,
-               sizeof(file_info)) < 0)
-      return -1;
-
-    nfiles++;
-  }
-
-  // Collect active processes.
-  for(int i = 0; i < NPROC; i++){
-    memset(&proc_info, 0, sizeof(proc_info));
-
-    int result = get_process_info(i, &proc_info);
-
-    if(result < 0)
-      return -1;
-
-    if(result == 0)
-      continue;
-
-    if(nprocs >= NPROC)
-      return -1;
-
-    uint64 dst = addr
-      + __builtin_offsetof(struct sysinfo, processes)
-      + (uint64)nprocs * sizeof(struct sysinfo_proc);
-
-    if(copyout(p->pagetable, dst,
-               (char *)&proc_info,
-               sizeof(proc_info)) < 0)
-      return -1;
-
-    nprocs++;
-  }
-
-  // Write counters after successfully collecting records.
-  if(copyout(p->pagetable,
-             addr + __builtin_offsetof(struct sysinfo, nopenfiles),
-             (char *)&nfiles, sizeof(nfiles)) < 0)
-    return -1;
-
-  if(copyout(p->pagetable,
-             addr + __builtin_offsetof(struct sysinfo, nproc),
-             (char *)&nprocs, sizeof(nprocs)) < 0)
-    return -1;
-
-  return 0;
+  return systeminfo(addr);
 }

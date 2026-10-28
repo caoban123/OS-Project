@@ -6,6 +6,7 @@
 #include "proc.h"
 #include "defs.h"
 #include "sysinfo.h"
+#include "sleeplock.h"
 
 struct cpu cpus[NCPU];
 
@@ -26,6 +27,11 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+// The result is larger than a kernel stack. Serialize use of this buffer,
+// allowing callers to sleep while waiting rather than spin during copyout.
+static struct sleeplock sysinfo_lock;
+static struct sysinfo sysinfo_snapshot;
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -52,6 +58,7 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initsleeplock(&sysinfo_lock, "sysinfo");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       initlock(&p->ofile_lock, "ofile");
@@ -734,106 +741,62 @@ nproc(void)
     return count;
 }
 
+// Lock order: sysinfo_lock -> wait_lock -> all p->lock (table order)
+// -> all ofile_lock (table order) -> ftable.lock inside file_snapshot().
+// Acquire every process lock BEFORE any FD lock: fork holds a child process
+// lock while copying the parent's FDs. No sleeping or copyout while frozen.
 int
-get_process_info(int index, struct sysinfo_proc *out)
+systeminfo(uint64 addr)
 {
-  if(index < 0 || index >= NPROC)
-    return -1;
+  struct proc *caller = myproc();
+  struct sysinfo *out = &sysinfo_snapshot;
+  int file_slots[NFILE];
 
-  struct proc *p = &proc[index];
-
-  // 1. Đọc thông tin process
-  acquire(&p->lock);
-
-  if(p->state == UNUSED){
-    release(&p->lock);
-    return 0;
-  }
-
-  out->pid = p->pid;
-  out->state = p->state;
-  out->scheduling_count = p->scheduling_count;
-
-  release(&p->lock);
-
-  // 2. Đọc danh sách file descriptor
-  acquire(&p->ofile_lock);
-
-  out->nfds = 0;
-
-  for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd] != 0){
-      int n = out->nfds++;
-
-      out->fds[n].fd = fd;
-      out->fds[n].file_id = file_index(p->ofile[fd]);
-    }
-  }
-
-  release(&p->ofile_lock);
-
-  // 3. Đọc PID của process cha
-  out->parent_pid = get_parent_pid(index);
-
-  return 1;
-}
-
-
-void
-get_file_pids(int file_id, struct sysinfo_file *out)
-{
-  out->npids = 0;
-
-  for(struct proc *p = proc; p < &proc[NPROC]; p++){
-
-    // 1. Kiểm tra trạng thái process
-    acquire(&p->lock);
-
-    int active = (p->state != UNUSED);
-    int pid = p->pid;
-
-    release(&p->lock);
-
-    if(!active)
-      continue;
-
-    // 2. Kiểm tra process có tham chiếu file không
-    acquire(&p->ofile_lock);
-
-    int found = 0;
-
-    for(int fd = 0; fd < NOFILE; fd++){
-      if(file_index(p->ofile[fd]) == file_id){
-        found = 1;
-        break;
-      }
-    }
-
-    release(&p->ofile_lock);
-
-    // 3. Lưu PID, tránh trùng do dup()
-    if(found && out->npids < NPROC){
-      out->pids[out->npids++] = pid;
-    }
-  }
-}
-
-
-int
-get_parent_pid(int index)
-{
-  if(index < 0 || index >= NPROC)
-    return -1;
-
-  struct proc *p = &proc[index];
-  int parent_pid = -1;
+  acquiresleep(&sysinfo_lock);
+  memset(out, 0, sizeof(*out));
+  for(int i = 0; i < NFILE; i++)
+    file_slots[i] = -1;
 
   acquire(&wait_lock);
+  for(int i = 0; i < NPROC; i++)
+    acquire(&proc[i].lock);
+  for(int i = 0; i < NPROC; i++)
+    acquire(&proc[i].ofile_lock);
 
-  if(p->parent != 0)
-    parent_pid = p->parent->pid;
+  file_snapshot(out);
+  for(int i = 0; i < out->nopenfiles; i++)
+    file_slots[out->files[i].file_id] = i;
 
+  for(struct proc *p = proc; p < &proc[NPROC]; p++){
+    if(p->state == UNUSED)
+      continue;
+    struct sysinfo_proc *dst = &out->processes[out->nproc++];
+    dst->pid = p->pid;
+    dst->state = p->state;
+    dst->parent_pid = p->parent ? p->parent->pid : -1;
+    dst->scheduling_count = p->scheduling_count;
+    for(int fd = 0; fd < NOFILE; fd++){
+      if(p->ofile[fd] == 0)
+        continue;
+      int id = file_index(p->ofile[fd]);
+      if(id < 0 || file_slots[id] < 0)
+        panic("sysinfo file");
+      dst->fds[dst->nfds].fd = fd;
+      dst->fds[dst->nfds++].file_id = id;
+      struct sysinfo_file *f = &out->files[file_slots[id]];
+      // All FDs of this process are adjacent in this scan; append PID once.
+      if(f->npids == 0 || f->pids[f->npids - 1] != p->pid)
+        f->pids[f->npids++] = p->pid;
+    }
+  }
+
+  for(int i = NPROC - 1; i >= 0; i--)
+    release(&proc[i].ofile_lock);
+  for(int i = NPROC - 1; i >= 0; i--)
+    release(&proc[i].lock);
   release(&wait_lock);
 
-  return parent_pid;
+  int result = copyout(caller->pagetable, addr, (char *)out, sizeof(*out));
+  releasesleep(&sysinfo_lock);
+  return result;
 }

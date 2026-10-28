@@ -35,6 +35,7 @@ filealloc(void)
   acquire(&ftable.lock);
   for(f = ftable.file; f < ftable.file + NFILE; f++){
     if(f->ref == 0){
+      memset(f, 0, sizeof(*f));
       f->ref = 1;
       release(&ftable.lock);
       return f;
@@ -199,31 +200,41 @@ nopenfiles(void)
   return count;
 }
 
-int
-get_open_file(int index, struct sysinfo_file *out)
+// Initialize immutable metadata before publishing the file in an FD table.
+// Serialize with file_snapshot(), including for allocated but unpublished files.
+void
+file_setup(struct file *f, int type, int readable, int writable,
+           struct inode *ip, struct pipe *pipe, short major)
 {
-  if(index < 0 || index >= NFILE)
-    return -1;
-
   acquire(&ftable.lock);
-
-  struct file *f = &ftable.file[index];
-
-  if(f->ref == 0){
-    release(&ftable.lock);
-    return 0;
-  }
-
-  out->file_id = index;
-  out->type = f->type;
-  out->readable = f->readable;
-  out->writable = f->writable;
-  out->ref = f->ref;
-  out->npids = 0;
-
+  f->type = type;
+  f->readable = readable;
+  f->writable = writable;
+  f->ip = ip;
+  f->pipe = pipe;
+  f->major = major;
+  f->off = 0;
   release(&ftable.lock);
+}
 
-  return 1;
+// Caller holds all process and FD-table locks. Do not sleep here.
+void
+file_snapshot(struct sysinfo *out)
+{
+  acquire(&ftable.lock);
+  for(int i = 0; i < NFILE; i++){
+    struct file *f = &ftable.file[i];
+    // FD_NONE is only a reservation still being initialized by open/pipe.
+    if(f->ref == 0 || f->type == FD_NONE)
+      continue;
+    struct sysinfo_file *dst = &out->files[out->nopenfiles++];
+    dst->file_id = i;
+    dst->type = f->type;
+    dst->readable = f->readable;
+    dst->writable = f->writable;
+    dst->ref = f->ref;
+  }
+  release(&ftable.lock);
 }
 
 int

@@ -64,9 +64,11 @@ sys_dup(void)
 
   if(argfd(0, 0, &f) < 0)
     return -1;
-  if((fd=fdalloc(f)) < 0)
-    return -1;
   filedup(f);
+  if((fd=fdalloc(f)) < 0){
+    fileclose(f);
+    return -1;
+  }
   return fd;
 }
 
@@ -361,24 +363,22 @@ sys_open(void)
     return -1;
   }
 
-  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
-    if(f)
-      fileclose(f);
+  if((f = filealloc()) == 0){
     iunlockput(ip);
     end_op();
     return -1;
   }
 
-  if(ip->type == T_DEVICE){
-    f->type = FD_DEVICE;
-    f->major = ip->major;
-  } else {
-    f->type = FD_INODE;
-    f->off = 0;
+  file_setup(f, ip->type == T_DEVICE ? FD_DEVICE : FD_INODE,
+             !(omode & O_WRONLY), (omode & O_WRONLY) || (omode & O_RDWR),
+             ip, 0, ip->type == T_DEVICE ? ip->major : 0);
+  if((fd = fdalloc(f)) < 0){
+    // fileclose() now owns the inode reference and may lock the inode.
+    iunlock(ip);
+    end_op();
+    fileclose(f);
+    return -1;
   }
-  f->ip = ip;
-  f->readable = !(omode & O_WRONLY);
-  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
 
   if((omode & O_TRUNC) && ip->type == T_FILE){
     itrunc(ip);

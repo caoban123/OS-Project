@@ -8,8 +8,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
-struct sysinfo_file;
-struct sysinfo_proc;
+struct sysinfo;
 
 
 // bio.c
@@ -37,7 +36,8 @@ int             fileread(struct file*, uint64, int n);
 int             filestat(struct file*, uint64 addr);
 int             filewrite(struct file*, uint64, int n);
 int nopenfiles(void);
-int get_open_file(int, struct sysinfo_file *);
+void            file_snapshot(struct sysinfo *);
+void            file_setup(struct file*, int, int, int, struct inode*, struct pipe*, short);
 int file_index(struct file *);
 
 // fs.c
@@ -114,9 +114,7 @@ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
 uint64 nproc(void);
-int get_process_info(int, struct sysinfo_proc *);
-void get_file_pids(int, struct sysinfo_file *);
-int get_parent_pid(int);
+int             systeminfo(uint64);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
