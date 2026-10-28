@@ -1,0 +1,1025 @@
+diff --git a/Makefile b/Makefile
+index 74e454f..6a9f9a4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -86,7 +86,8 @@ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ 
+ CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -gdwarf-2
+-
++CFLAGS += -march=rv64g
++ASFLAGS = -march=rv64g
+ ifdef LAB
+ LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
+ XCFLAGS += -DSOL_$(LABUPPER) -DLAB_$(LABUPPER)
+@@ -194,6 +195,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_sysinfotest\
++
+ 
+ 
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..f0e80cd 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,9 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct sysinfo_file;
++struct sysinfo_proc;
++
+ 
+ // bio.c
+ void            binit(void);
+@@ -33,6 +36,9 @@ void            fileinit(void);
+ int             fileread(struct file*, uint64, int n);
+ int             filestat(struct file*, uint64 addr);
+ int             filewrite(struct file*, uint64, int n);
++int nopenfiles(void);
++int get_open_file(int, struct sysinfo_file *);
++int file_index(struct file *);
+ 
+ // fs.c
+ void            fsinit(int);
+@@ -63,6 +69,7 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++uint64 freemem(void);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -106,6 +113,10 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++uint64 nproc(void);
++int get_process_info(int, struct sysinfo_proc *);
++void get_file_pids(int, struct sysinfo_file *);
++int get_parent_pid(int);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/file.c b/kernel/file.c
+index 25fa226..71bb977 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -12,6 +12,7 @@
+ #include "file.h"
+ #include "stat.h"
+ #include "proc.h"
++#include "sysinfo.h"
+ 
+ struct devsw devsw[NDEV];
+ struct {
+@@ -180,3 +181,61 @@ filewrite(struct file *f, uint64 addr, int n)
+   return ret;
+ }
+ 
++int
++nopenfiles(void)
++{
++  int count = 0;
++
++  acquire(&ftable.lock);
++
++  for(int i = 0; i < NFILE; i++){
++    if(ftable.file[i].ref > 0){
++      count++;
++    }
++  }
++
++  release(&ftable.lock);
++
++  return count;
++}
++
++int
++get_open_file(int index, struct sysinfo_file *out)
++{
++  if(index < 0 || index >= NFILE)
++    return -1;
++
++  acquire(&ftable.lock);
++
++  struct file *f = &ftable.file[index];
++
++  if(f->ref == 0){
++    release(&ftable.lock);
++    return 0;
++  }
++
++  out->file_id = index;
++  out->type = f->type;
++  out->readable = f->readable;
++  out->writable = f->writable;
++  out->ref = f->ref;
++  out->npids = 0;
++
++  release(&ftable.lock);
++
++  return 1;
++}
++
++int
++file_index(struct file *f)
++{
++  if(f == 0)
++    return -1;
++
++  for(int i = 0; i < NFILE; i++){
++    if(f == &ftable.file[i])
++      return i;
++  }
++
++  return -1;
++}
+\ No newline at end of file
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 5247b91..a62096a 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -91,3 +91,21 @@ kalloc(void)
+   return (void*)r;
+ }
+ 
++uint64
++freemem(void)
++{
++    uint64 count = 0;
++    struct run *r;
++
++    acquire(&kmem.lock);
++
++    r = kmem.freelist;
++    while (r != 0) {
++        count++;
++        r = r->next;
++    }
++
++    release(&kmem.lock);
++
++    return count * PGSIZE;
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 130d9ce..59546ea 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "sysinfo.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -53,6 +54,7 @@ procinit(void)
+   initlock(&wait_lock, "wait_lock");
+   for(p = proc; p < &proc[NPROC]; p++) {
+       initlock(&p->lock, "proc");
++      initlock(&p->ofile_lock, "ofile");
+       p->state = UNUSED;
+       p->kstack = KSTACK((int) (p - proc));
+   }
+@@ -124,6 +126,7 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->scheduling_count = 0;
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -169,6 +172,7 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++  p->scheduling_count = 0;
+ }
+ 
+ // Create a user page table for a given process, with no user memory,
+@@ -303,9 +307,19 @@ fork(void)
+   np->trapframe->a0 = 0;
+ 
+   // increment reference counts on open file descriptors.
+-  for(i = 0; i < NOFILE; i++)
+-    if(p->ofile[i])
++  acquire(&p->ofile_lock);
++
++  acquire(&np->ofile_lock);
++
++  for(i = 0; i < NOFILE; i++){
++    if(p->ofile[i]){
+       np->ofile[i] = filedup(p->ofile[i]);
++    }
++  }
++
++  release(&np->ofile_lock);
++
++  release(&p->ofile_lock);
+   np->cwd = idup(p->cwd);
+ 
+   safestrcpy(np->name, p->name, sizeof(p->name));
+@@ -353,11 +367,17 @@ exit(int status)
+ 
+   // Close all open files.
+   for(int fd = 0; fd < NOFILE; fd++){
+-    if(p->ofile[fd]){
+-      struct file *f = p->ofile[fd];
++    struct file *f;
++
++    acquire(&p->ofile_lock);
++
++    f = p->ofile[fd];
++    p->ofile[fd] = 0;
++
++    release(&p->ofile_lock);
++
++    if(f != 0)
+       fileclose(f);
+-      p->ofile[fd] = 0;
+-    }
+   }
+ 
+   begin_op();
+@@ -461,6 +481,7 @@ scheduler(void)
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
++        p->scheduling_count++;
+         p->state = RUNNING;
+         c->proc = p;
+         swtch(&c->context, &p->context);
+@@ -693,3 +714,126 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++uint64
++nproc(void)
++{
++    uint64 count = 0;
++    struct proc *p;
++
++    for (p = proc; p < &proc[NPROC]; p++) {
++        acquire(&p->lock);
++
++        if (p->state != UNUSED) {
++            count++;
++        }
++
++        release(&p->lock);
++    }
++
++    return count;
++}
++
++int
++get_process_info(int index, struct sysinfo_proc *out)
++{
++  if(index < 0 || index >= NPROC)
++    return -1;
++
++  struct proc *p = &proc[index];
++
++  // 1. Đọc thông tin process
++  acquire(&p->lock);
++
++  if(p->state == UNUSED){
++    release(&p->lock);
++    return 0;
++  }
++
++  out->pid = p->pid;
++  out->state = p->state;
++  out->scheduling_count = p->scheduling_count;
++
++  release(&p->lock);
++
++  // 2. Đọc danh sách file descriptor
++  acquire(&p->ofile_lock);
++
++  out->nfds = 0;
++
++  for(int fd = 0; fd < NOFILE; fd++){
++    if(p->ofile[fd] != 0){
++      int n = out->nfds++;
++
++      out->fds[n].fd = fd;
++      out->fds[n].file_id = file_index(p->ofile[fd]);
++    }
++  }
++
++  release(&p->ofile_lock);
++
++  // 3. Đọc PID của process cha
++  out->parent_pid = get_parent_pid(index);
++
++  return 1;
++}
++
++
++void
++get_file_pids(int file_id, struct sysinfo_file *out)
++{
++  out->npids = 0;
++
++  for(struct proc *p = proc; p < &proc[NPROC]; p++){
++
++    // 1. Kiểm tra trạng thái process
++    acquire(&p->lock);
++
++    int active = (p->state != UNUSED);
++    int pid = p->pid;
++
++    release(&p->lock);
++
++    if(!active)
++      continue;
++
++    // 2. Kiểm tra process có tham chiếu file không
++    acquire(&p->ofile_lock);
++
++    int found = 0;
++
++    for(int fd = 0; fd < NOFILE; fd++){
++      if(file_index(p->ofile[fd]) == file_id){
++        found = 1;
++        break;
++      }
++    }
++
++    release(&p->ofile_lock);
++
++    // 3. Lưu PID, tránh trùng do dup()
++    if(found && out->npids < NPROC){
++      out->pids[out->npids++] = pid;
++    }
++  }
++}
++
++
++int
++get_parent_pid(int index)
++{
++  if(index < 0 || index >= NPROC)
++    return -1;
++
++  struct proc *p = &proc[index];
++  int parent_pid = -1;
++
++  acquire(&wait_lock);
++
++  if(p->parent != 0)
++    parent_pid = p->parent->pid;
++
++  release(&wait_lock);
++
++  return parent_pid;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..ae6b5fc 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -84,14 +84,14 @@ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+-
++  struct spinlock ofile_lock;
+   // p->lock must be held when using these:
+   enum procstate state;        // Process state
+   void *chan;                  // If non-zero, sleeping on chan
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
+-
++  uint64 scheduling_count;
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+ 
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..818a515 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,7 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+-
++extern uint64 sys_sysinfo(void);
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+ static uint64 (*syscalls[])(void) = {
+@@ -126,6 +126,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sysinfo] sys_sysinfo,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..9db11e4 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sysinfo 22
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 16b668c..c1dbf7e 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -42,12 +42,17 @@ fdalloc(struct file *f)
+   int fd;
+   struct proc *p = myproc();
+ 
++  acquire(&p->ofile_lock);
++
+   for(fd = 0; fd < NOFILE; fd++){
+     if(p->ofile[fd] == 0){
+       p->ofile[fd] = f;
++      release(&p->ofile_lock);
+       return fd;
+     }
+   }
++
++  release(&p->ofile_lock);
+   return -1;
+ }
+ 
+@@ -99,11 +104,28 @@ sys_close(void)
+ {
+   int fd;
+   struct file *f;
++  struct proc *p = myproc();
++
++  argint(0, &fd);
+ 
+-  if(argfd(0, &fd, &f) < 0)
++  if(fd < 0 || fd >= NOFILE)
+     return -1;
+-  myproc()->ofile[fd] = 0;
++
++  acquire(&p->ofile_lock);
++
++  f = p->ofile[fd];
++
++  if(f == 0){
++    release(&p->ofile_lock);
++    return -1;
++  }
++
++  p->ofile[fd] = 0;
++
++  release(&p->ofile_lock);
++
+   fileclose(f);
++
+   return 0;
+ }
+ 
+@@ -155,9 +177,7 @@ sys_link(void)
+   }
+   iunlockput(dp);
+   iput(ip);
+-
+   end_op();
+-
+   return 0;
+ 
+ bad:
+@@ -487,19 +507,28 @@ sys_pipe(void)
+     return -1;
+   fd0 = -1;
+   if((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0){
+-    if(fd0 >= 0)
++    if(fd0 >= 0){
++      acquire(&p->ofile_lock);
+       p->ofile[fd0] = 0;
++      release(&p->ofile_lock);
++    }
++
+     fileclose(rf);
+     fileclose(wf);
+     return -1;
+   }
+   if(copyout(p->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
+-     copyout(p->pagetable, fdarray+sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0){
+-    p->ofile[fd0] = 0;
+-    p->ofile[fd1] = 0;
+-    fileclose(rf);
+-    fileclose(wf);
+-    return -1;
+-  }
++   copyout(p->pagetable, fdarray + sizeof(fd0),
++           (char*)&fd1, sizeof(fd1)) < 0){
++
++  acquire(&p->ofile_lock);
++  p->ofile[fd0] = 0;
++  p->ofile[fd1] = 0;
++  release(&p->ofile_lock);
++
++  fileclose(rf);
++  fileclose(wf);
++  return -1;
++}
+   return 0;
+ }
+diff --git a/kernel/sysinfo.h b/kernel/sysinfo.h
+index fb878e6..4157e95 100644
+--- a/kernel/sysinfo.h
++++ b/kernel/sysinfo.h
+@@ -1,4 +1,41 @@
++#ifndef SYSINFO_H
++#define SYSINFO_H
++
++#include "types.h"
++#include "param.h"
++
++struct sysinfo_fd {
++  int fd;
++  int file_id;
++};
++
++struct sysinfo_file {
++  int file_id;
++  int type;
++  int readable;
++  int writable;
++  int ref;
++
++  int npids;
++  int pids[NPROC];
++};
++
++struct sysinfo_proc {
++  int pid;
++  int state;
++  int parent_pid;
++  uint64 scheduling_count;
++
++  int nfds;
++  struct sysinfo_fd fds[NOFILE];
++};
++
+ struct sysinfo {
+-  uint64 freemem;   // amount of free memory (bytes)
+-  uint64 nproc;     // number of process
++  int nopenfiles;
++  int nproc;
++
++  struct sysinfo_file files[NFILE];
++  struct sysinfo_proc processes[NPROC];
+ };
++
++#endif
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..2678696 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,6 +5,8 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "sysinfo.h"
++
+ 
+ uint64
+ sys_exit(void)
+@@ -91,3 +93,80 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_sysinfo(void)
++{
++  uint64 addr;
++  struct proc *p = myproc();
++
++  argaddr(0, &addr);
++
++  int nfiles = 0;
++  int nprocs = 0;
++
++  struct sysinfo_file file_info;
++  struct sysinfo_proc proc_info;
++
++  // Khởi tạo vùng kết quả phía user.
++  // Chỉ ghi các record hợp lệ và các bộ đếm.
++  for(int i = 0; i < NFILE; i++){
++    memset(&file_info, 0, sizeof(file_info));
++
++    int result = get_open_file(i, &file_info);
++
++    if(result < 0)
++      return -1;
++
++    if(result == 0)
++      continue;
++
++    get_file_pids(i, &file_info);
++
++    uint64 dst = addr
++      + __builtin_offsetof(struct sysinfo, files)
++      + nfiles * sizeof(struct sysinfo_file);
++
++    if(copyout(p->pagetable, dst,
++               (char *)&file_info,
++               sizeof(file_info)) < 0)
++      return -1;
++
++    nfiles++;
++  }
++
++  for(int i = 0; i < NPROC; i++){
++    memset(&proc_info, 0, sizeof(proc_info));
++
++    int result = get_process_info(i, &proc_info);
++
++    if(result < 0)
++      return -1;
++
++    if(result == 0)
++      continue;
++
++    uint64 dst = addr
++      + __builtin_offsetof(struct sysinfo, processes)
++      + nprocs * sizeof(struct sysinfo_proc);
++
++    if(copyout(p->pagetable, dst,
++               (char *)&proc_info,
++               sizeof(proc_info)) < 0)
++      return -1;
++
++    nprocs++;
++  }
++
++  if(copyout(p->pagetable,
++             addr + __builtin_offsetof(struct sysinfo, nopenfiles),
++             (char *)&nfiles, sizeof(nfiles)) < 0)
++    return -1;
++
++  if(copyout(p->pagetable,
++             addr + __builtin_offsetof(struct sysinfo, nproc),
++             (char *)&nprocs, sizeof(nprocs)) < 0)
++    return -1;
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/sysinfotest.c b/user/sysinfotest.c
+index a92d10a..3d88f69 100644
+--- a/user/sysinfotest.c
++++ b/user/sysinfotest.c
+@@ -1,153 +1,195 @@
+ #include "kernel/types.h"
+-#include "kernel/riscv.h"
++#include "kernel/stat.h"
++#include "kernel/fcntl.h"
+ #include "kernel/sysinfo.h"
+ #include "user/user.h"
+ 
++static struct sysinfo *info;
+ 
+-void
+-sinfo(struct sysinfo *info) {
+-  if (sysinfo(info) < 0) {
+-    printf("FAIL: sysinfo failed");
+-    exit(1);
+-  }
+-}
+-
+-//
+-// use sbrk() to count how many free physical memory pages there are.
+-//
++// Find file_id from a process's fd.
+ int
+-countfree()
++find_file_id(int pid, int fd)
+ {
+-  uint64 sz0 = (uint64)sbrk(0);
+-  struct sysinfo info;
+-  int n = 0;
++  for(int i = 0; i < info->nproc; i++){
++    struct sysinfo_proc *p = &info->processes[i];
+ 
+-  while(1){
+-    if((uint64)sbrk(PGSIZE) == 0xffffffffffffffff){
+-      break;
++    if(p->pid != pid)
++      continue;
++
++    for(int j = 0; j < p->nfds; j++){
++      if(p->fds[j].fd == fd)
++        return p->fds[j].file_id;
+     }
+-    n += PGSIZE;
+   }
+-  sinfo(&info);
+-  if (info.freemem != 0) {
+-    printf("FAIL: there is no free mem, but sysinfo.freemem=%ld\n",
+-      info.freemem);
+-    exit(1);
++
++  return -1;
++}
++
++// Find an open file by file_id.
++struct sysinfo_file *
++find_file(int file_id)
++{
++  for(int i = 0; i < info->nopenfiles; i++){
++    if(info->files[i].file_id == file_id)
++      return &info->files[i];
+   }
+-  sbrk(-((uint64)sbrk(0) - sz0));
+-  return n;
++
++  return 0;
+ }
+ 
+ void
+-testmem() {
+-  struct sysinfo info;
+-  uint64 n = countfree();
+-  
+-  sinfo(&info);
+-
+-  if (info.freemem!= n) {
+-    printf("FAIL: free mem %ld (bytes) instead of %ld\n", info.freemem, n);
+-    exit(1);
+-  }
+-  
+-  if((uint64)sbrk(PGSIZE) == 0xffffffffffffffff){
+-    printf("sbrk failed");
++refresh(void)
++{
++  memset(info, 0, sizeof(*info));
++
++  if(sysinfo(info) < 0){
++    printf("FAIL: sysinfo syscall\n");
+     exit(1);
+   }
++}
+ 
+-  sinfo(&info);
+-    
+-  if (info.freemem != n-PGSIZE) {
+-    printf("FAIL: free mem %ld (bytes) instead of %ld\n", n-PGSIZE, info.freemem);
++void
++print_summary(char *label)
++{
++  refresh();
++
++  printf("%s: files=%d, processes=%d\n",
++         label, info->nopenfiles, info->nproc);
++}
++
++int
++main(void)
++{
++  info = malloc(sizeof(struct sysinfo));
++
++  if(info == 0){
++    printf("FAIL: malloc\n");
+     exit(1);
+   }
+-  
+-  if((uint64)sbrk(-PGSIZE) == 0xffffffffffffffff){
+-    printf("sbrk failed");
++
++  int pid = getpid();
++
++  printf("=== SYSINFO TEST ===\n");
++
++  // Test 1: Baseline
++  print_summary("Baseline");
++
++  int baseline_files = info->nopenfiles;
++
++  // Test 2: open()
++  int fd = open("sysinfo_test.tmp",
++                O_CREATE | O_RDWR);
++
++  if(fd < 0){
++    printf("FAIL: open\n");
+     exit(1);
+   }
+ 
+-  sinfo(&info);
+-    
+-  if (info.freemem != n) {
+-    printf("FAIL: free mem %ld (bytes) instead of %ld\n", n, info.freemem);
++  refresh();
++
++  int file_id = find_file_id(pid, fd);
++  struct sysinfo_file *f = find_file(file_id);
++
++  if(file_id < 0 || f == 0 ||
++     info->nopenfiles != baseline_files + 1){
++    printf("FAIL: open test\n");
+     exit(1);
+   }
+-}
+ 
+-void
+-testcall() {
+-  struct sysinfo info;
+-  
+-  if (sysinfo(&info) < 0) {
+-    printf("FAIL: sysinfo failed\n");
++  int ref_before_dup = f->ref;
++
++  printf("PASS: open, file_id=%d, ref=%d\n",
++         file_id, ref_before_dup);
++
++  // Test 3: dup()
++  int fd2 = dup(fd);
++
++  if(fd2 < 0){
++    printf("FAIL: dup\n");
+     exit(1);
+   }
+ 
+-  if (sysinfo((struct sysinfo *) 0xeaeb0b5b00002f5e) !=  0xffffffffffffffff) {
+-    printf("FAIL: sysinfo succeeded with bad argument\n");
++  refresh();
++
++  int duplicated_file_id = find_file_id(pid, fd2);
++  f = find_file(file_id);
++
++  if(duplicated_file_id != file_id ||
++     f == 0 ||
++     f->ref != ref_before_dup + 1 ||
++     info->nopenfiles != baseline_files + 1){
++    printf("FAIL: dup test\n");
+     exit(1);
+   }
+-}
+ 
+-void testproc() {
+-  struct sysinfo info;
+-  uint64 nproc;
+-  int status;
+-  int pid;
+-  
+-  sinfo(&info);
+-  nproc = info.nproc;
+-
+-  pid = fork();
+-  if(pid < 0){
+-    printf("sysinfotest: fork failed\n");
++  printf("PASS: dup, ref=%d\n", f->ref);
++
++  // Test 4: fork()
++  int child = fork();
++
++  if(child < 0){
++    printf("FAIL: fork\n");
+     exit(1);
+   }
+-  if(pid == 0){
+-    sinfo(&info);
+-    if(info.nproc != nproc+1) {
+-      printf("sysinfotest: FAIL nproc is %ld instead of %ld\n", info.nproc, nproc+1);
+-      exit(1);
+-    }
++
++  if(child == 0){
++    // Child retains inherited descriptors.
++    sleep(30);
+     exit(0);
+   }
+-  wait(&status);
+-  sinfo(&info);
+-  if(info.nproc != nproc) {
+-      printf("sysinfotest: FAIL nproc is %ld instead of %ld\n", info.nproc, nproc);
+-      exit(1);
+-  }
+-}
+ 
+-void testbad() {
+-  int pid = fork();
+-  int xstatus;
+-  
+-  if(pid < 0){
+-    printf("sysinfotest: fork failed\n");
++  sleep(5);
++  refresh();
++
++  int child_fd = find_file_id(child, fd);
++  int child_fd2 = find_file_id(child, fd2);
++
++  f = find_file(file_id);
++
++  if(child_fd != file_id ||
++     child_fd2 != file_id ||
++     f == 0 ||
++     f->ref < ref_before_dup + 3){
++    printf("FAIL: fork test\n");
++    wait(0);
+     exit(1);
+   }
+-  if(pid == 0){
+-      sinfo(0x0);
+-      exit(0);
++
++  printf("PASS: fork, child PID=%d, ref=%d\n",
++         child, f->ref);
++
++  // Test 5: wait()
++  wait(0);
++  refresh();
++
++  f = find_file(file_id);
++
++  if(f == 0 || f->ref != ref_before_dup + 1){
++    printf("FAIL: wait/exit test\n");
++    exit(1);
+   }
+-  wait(&xstatus);
+-  if(xstatus == -1)  // kernel killed child?
+-    exit(0);
+-  else {
+-    printf("sysinfotest: testbad succeeded %d\n", xstatus);
+-    exit(xstatus);
++
++  printf("PASS: child exit and wait\n");
++
++  // Test 6: close()
++  close(fd2);
++  close(fd);
++
++  refresh();
++
++  if(find_file(file_id) != 0){
++    printf("FAIL: close test\n");
++    exit(1);
+   }
+-}
+ 
+-int
+-main(int argc, char *argv[])
+-{
+-  printf("sysinfotest: start\n");
+-  testcall();
+-  testmem();
+-  testproc();
+-  printf("sysinfotest: OK\n");
++  printf("PASS: close\n");
++
++  unlink("sysinfo_test.tmp");
++
++  print_summary("Final");
++
++  printf("=== ALL TESTS PASSED ===\n");
++
++  free(info);
+   exit(0);
+-}
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index f16fe27..71ec8ec 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++struct sysinfo;
++int sysinfo(struct sysinfo *);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usertests.c b/user/usertests.c
+index 28b53f9..7df0278 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -244,7 +244,7 @@ copyinstr3(char *s)
+ // See if the kernel refuses to read/write user memory that the
+ // application doesn't have anymore, because it returned it.
+ void
+-rwsbrk()
++rwsbrk(char *s)
+ {
+   int fd, n;
+   
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..4f1f768 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sysinfo");

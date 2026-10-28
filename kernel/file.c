@@ -12,6 +12,7 @@
 #include "file.h"
 #include "stat.h"
 #include "proc.h"
+#include "sysinfo.h"
 
 struct devsw devsw[NDEV];
 struct {
@@ -180,3 +181,61 @@ filewrite(struct file *f, uint64 addr, int n)
   return ret;
 }
 
+int
+nopenfiles(void)
+{
+  int count = 0;
+
+  acquire(&ftable.lock);
+
+  for(int i = 0; i < NFILE; i++){
+    if(ftable.file[i].ref > 0){
+      count++;
+    }
+  }
+
+  release(&ftable.lock);
+
+  return count;
+}
+
+int
+get_open_file(int index, struct sysinfo_file *out)
+{
+  if(index < 0 || index >= NFILE)
+    return -1;
+
+  acquire(&ftable.lock);
+
+  struct file *f = &ftable.file[index];
+
+  if(f->ref == 0){
+    release(&ftable.lock);
+    return 0;
+  }
+
+  out->file_id = index;
+  out->type = f->type;
+  out->readable = f->readable;
+  out->writable = f->writable;
+  out->ref = f->ref;
+  out->npids = 0;
+
+  release(&ftable.lock);
+
+  return 1;
+}
+
+int
+file_index(struct file *f)
+{
+  if(f == 0)
+    return -1;
+
+  for(int i = 0; i < NFILE; i++){
+    if(f == &ftable.file[i])
+      return i;
+  }
+
+  return -1;
+}

@@ -42,12 +42,17 @@ fdalloc(struct file *f)
   int fd;
   struct proc *p = myproc();
 
+  acquire(&p->ofile_lock);
+
   for(fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd] == 0){
       p->ofile[fd] = f;
+      release(&p->ofile_lock);
       return fd;
     }
   }
+
+  release(&p->ofile_lock);
   return -1;
 }
 
@@ -99,11 +104,28 @@ sys_close(void)
 {
   int fd;
   struct file *f;
+  struct proc *p = myproc();
 
-  if(argfd(0, &fd, &f) < 0)
+  argint(0, &fd);
+
+  if(fd < 0 || fd >= NOFILE)
     return -1;
-  myproc()->ofile[fd] = 0;
+
+  acquire(&p->ofile_lock);
+
+  f = p->ofile[fd];
+
+  if(f == 0){
+    release(&p->ofile_lock);
+    return -1;
+  }
+
+  p->ofile[fd] = 0;
+
+  release(&p->ofile_lock);
+
   fileclose(f);
+
   return 0;
 }
 
@@ -155,9 +177,7 @@ sys_link(void)
   }
   iunlockput(dp);
   iput(ip);
-
   end_op();
-
   return 0;
 
 bad:
@@ -487,16 +507,25 @@ sys_pipe(void)
     return -1;
   fd0 = -1;
   if((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0){
-    if(fd0 >= 0)
+    if(fd0 >= 0){
+      acquire(&p->ofile_lock);
       p->ofile[fd0] = 0;
+      release(&p->ofile_lock);
+    }
+
     fileclose(rf);
     fileclose(wf);
     return -1;
   }
   if(copyout(p->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
-     copyout(p->pagetable, fdarray+sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0){
+   copyout(p->pagetable, fdarray + sizeof(fd0),
+           (char*)&fd1, sizeof(fd1)) < 0){
+
+    acquire(&p->ofile_lock);
     p->ofile[fd0] = 0;
     p->ofile[fd1] = 0;
+    release(&p->ofile_lock);
+
     fileclose(rf);
     fileclose(wf);
     return -1;

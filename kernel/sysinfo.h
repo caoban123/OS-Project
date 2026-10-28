@@ -1,4 +1,41 @@
-struct sysinfo {
-  uint64 freemem;   // amount of free memory (bytes)
-  uint64 nproc;     // number of process
+#ifndef SYSINFO_H
+#define SYSINFO_H
+
+#include "types.h"
+#include "param.h"
+
+struct sysinfo_fd {
+  int fd;
+  int file_id;
 };
+
+struct sysinfo_file {
+  int file_id;
+  int type;
+  int readable;
+  int writable;
+  int ref;
+
+  int npids;
+  int pids[NPROC];
+};
+
+struct sysinfo_proc {
+  int pid;
+  int state;
+  int parent_pid;
+  uint64 scheduling_count;
+
+  int nfds;
+  struct sysinfo_fd fds[NOFILE];
+};
+
+struct sysinfo {
+  int nopenfiles;
+  int nproc;
+
+  struct sysinfo_file files[NFILE];
+  struct sysinfo_proc processes[NPROC];
+};
+
+#endif

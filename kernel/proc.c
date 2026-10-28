@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sysinfo.h"
 
 struct cpu cpus[NCPU];
 
@@ -53,6 +54,7 @@ procinit(void)
   initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
+      initlock(&p->ofile_lock, "ofile");
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
   }
@@ -124,6 +126,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->scheduling_count = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -169,6 +172,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->scheduling_count = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -303,9 +307,19 @@ fork(void)
   np->trapframe->a0 = 0;
 
   // increment reference counts on open file descriptors.
-  for(i = 0; i < NOFILE; i++)
-    if(p->ofile[i])
+  acquire(&p->ofile_lock);
+
+  acquire(&np->ofile_lock);
+
+  for(i = 0; i < NOFILE; i++){
+    if(p->ofile[i]){
       np->ofile[i] = filedup(p->ofile[i]);
+    }
+  }
+
+  release(&np->ofile_lock);
+
+  release(&p->ofile_lock);
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
@@ -353,11 +367,17 @@ exit(int status)
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd]){
-      struct file *f = p->ofile[fd];
+    struct file *f;
+
+    acquire(&p->ofile_lock);
+
+    f = p->ofile[fd];
+    p->ofile[fd] = 0;
+
+    release(&p->ofile_lock);
+
+    if(f != 0)
       fileclose(f);
-      p->ofile[fd] = 0;
-    }
   }
 
   begin_op();
@@ -461,6 +481,7 @@ scheduler(void)
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
+        p->scheduling_count++;
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
@@ -692,4 +713,127 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+uint64
+nproc(void)
+{
+    uint64 count = 0;
+    struct proc *p;
+
+    for (p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+
+        if (p->state != UNUSED) {
+            count++;
+        }
+
+        release(&p->lock);
+    }
+
+    return count;
+}
+
+int
+get_process_info(int index, struct sysinfo_proc *out)
+{
+  if(index < 0 || index >= NPROC)
+    return -1;
+
+  struct proc *p = &proc[index];
+
+  // 1. Đọc thông tin process
+  acquire(&p->lock);
+
+  if(p->state == UNUSED){
+    release(&p->lock);
+    return 0;
+  }
+
+  out->pid = p->pid;
+  out->state = p->state;
+  out->scheduling_count = p->scheduling_count;
+
+  release(&p->lock);
+
+  // 2. Đọc danh sách file descriptor
+  acquire(&p->ofile_lock);
+
+  out->nfds = 0;
+
+  for(int fd = 0; fd < NOFILE; fd++){
+    if(p->ofile[fd] != 0){
+      int n = out->nfds++;
+
+      out->fds[n].fd = fd;
+      out->fds[n].file_id = file_index(p->ofile[fd]);
+    }
+  }
+
+  release(&p->ofile_lock);
+
+  // 3. Đọc PID của process cha
+  out->parent_pid = get_parent_pid(index);
+
+  return 1;
+}
+
+
+void
+get_file_pids(int file_id, struct sysinfo_file *out)
+{
+  out->npids = 0;
+
+  for(struct proc *p = proc; p < &proc[NPROC]; p++){
+
+    // 1. Kiểm tra trạng thái process
+    acquire(&p->lock);
+
+    int active = (p->state != UNUSED);
+    int pid = p->pid;
+
+    release(&p->lock);
+
+    if(!active)
+      continue;
+
+    // 2. Kiểm tra process có tham chiếu file không
+    acquire(&p->ofile_lock);
+
+    int found = 0;
+
+    for(int fd = 0; fd < NOFILE; fd++){
+      if(file_index(p->ofile[fd]) == file_id){
+        found = 1;
+        break;
+      }
+    }
+
+    release(&p->ofile_lock);
+
+    // 3. Lưu PID, tránh trùng do dup()
+    if(found && out->npids < NPROC){
+      out->pids[out->npids++] = pid;
+    }
+  }
+}
+
+
+int
+get_parent_pid(int index)
+{
+  if(index < 0 || index >= NPROC)
+    return -1;
+
+  struct proc *p = &proc[index];
+  int parent_pid = -1;
+
+  acquire(&wait_lock);
+
+  if(p->parent != 0)
+    parent_pid = p->parent->pid;
+
+  release(&wait_lock);
+
+  return parent_pid;
 }
