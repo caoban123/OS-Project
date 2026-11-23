@@ -19,8 +19,8 @@ int flags2perm(int flags)
     return perm;
 }
 
-int
-exec(char *path, char **argv)
+static int
+exec_common(char *path, char **argv, int print_pt)
 {
   char *s, *last;
   int i, off;
@@ -128,6 +128,9 @@ exec(char *path, char **argv)
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+  if(print_pt)
+    vmprint(p->pagetable);
+
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
  bad:
@@ -138,6 +141,18 @@ exec(char *path, char **argv)
     end_op();
   }
   return -1;
+}
+
+int
+exec(char *path, char **argv)
+{
+  return exec_common(path, argv, 0);
+}
+
+int
+exec_vmprint(char *path, char **argv)
+{
+  return exec_common(path, argv, 1);
 }
 
 // Load a program segment into pagetable at virtual address va.

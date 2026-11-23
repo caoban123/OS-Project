@@ -38,3 +38,4 @@ entry("sleep");
 entry("uptime");
 entry("sysinfo");
 entry("trace");
+entry("exec_vmprint");

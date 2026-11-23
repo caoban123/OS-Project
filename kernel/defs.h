@@ -26,6 +26,7 @@ void            consputc(int);
 
 // exec.c
 int             exec(char*, char**);
+int             exec_vmprint(char*, char**);
 
 // file.c
 struct file*    filealloc(void);

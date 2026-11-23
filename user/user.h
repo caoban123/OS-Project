@@ -25,6 +25,7 @@ int uptime(void);
 struct sysinfo;
 int sysinfo(struct sysinfo *);
 int trace(int);
+int exec_vmprint(const char*, char**);
 
 // ulib.c
 int stat(const char*, struct stat*);
