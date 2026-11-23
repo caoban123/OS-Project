@@ -104,6 +104,7 @@ extern uint64 sys_close(void);
 extern uint64 sys_trace(void);
 extern uint64 sys_sysinfo(void);
 extern uint64 sys_exec_vmprint(void);
+extern uint64 sys_pgaccess(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -132,6 +133,7 @@ static uint64 (*syscalls[])(void) = {
 [SYS_trace]   sys_trace,
 [SYS_sysinfo] sys_sysinfo,
 [SYS_exec_vmprint] sys_exec_vmprint,
+[SYS_pgaccess] sys_pgaccess,
 };
 
 static char *syscall_names[] = {
@@ -159,6 +161,7 @@ static char *syscall_names[] = {
 [SYS_trace]   = "trace",
 [SYS_sysinfo] = "sysinfo",
 [SYS_exec_vmprint] = "exec_vmprint",
+[SYS_pgaccess] = "pgaccess",
 };
 
 void

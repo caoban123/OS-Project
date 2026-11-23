@@ -121,3 +121,40 @@ sys_trace(void)
 
   return 0;
 }
+
+#define PGACCESS_MAX 32
+
+uint64
+sys_pgaccess(void)
+{
+  uint64 base;
+  int len;
+  uint64 mask_addr;
+
+  argaddr(0, &base);
+  argint(1, &len);
+  argaddr(2, &mask_addr);
+
+  if(len < 0 || len > PGACCESS_MAX)
+    return -1;
+
+  uint64 va = PGROUNDDOWN(base);
+  if(va >= MAXVA || (uint64)len * PGSIZE > MAXVA - va)
+    return -1;
+
+  struct proc *p = myproc();
+  uint32 abits = 0;
+
+  for(int i = 0; i < len; i++, va += PGSIZE){
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if(pte != 0 && (*pte & PTE_V) && (*pte & PTE_U) && (*pte & PTE_A)){
+      abits |= (1U << i);
+      *pte &= ~PTE_A;
+    }
+  }
+
+  if(copyout(p->pagetable, mask_addr, (char *)&abits, sizeof(abits)) < 0)
+    return -1;
+
+  return 0;
+}
