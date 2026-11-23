@@ -197,6 +197,7 @@ UPROGS=\
 	$U/_zombie\
 	$U/_sysinfotest\
 	$U/_vmprint\
+	$U/_pgtbltest\
 
 
 
