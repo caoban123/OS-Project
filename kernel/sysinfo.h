@@ -37,6 +37,7 @@ struct sysinfo_proc {
 struct sysinfo {
   int nopenfiles;
   int nproc;
+  uint64 freemem;
 
   struct sysinfo_file files[NFILE];
   struct sysinfo_proc processes[NPROC];

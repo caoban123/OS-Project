@@ -160,10 +160,41 @@ test_basic(void)
   printf("Current PID: %d\n", me);
   printf("Active processes: %d\n", info->nproc);
   printf("Open file objects: %d\n", info->nopenfiles);
+  printf("Free memory: %lu bytes\n", info->freemem);
   printf("Scheduling count: %d\n",
          (int)p->scheduling_count);
 
   printf("Basic sysinfo checks completed\n");
+}
+
+void
+test_freemem(void)
+{
+  printf("\n=== FREE MEMORY ===\n");
+
+  refresh();
+  uint64 before = info->freemem;
+  require(before > 0, "Free memory should be positive");
+  require((before % 4096) == 0, "Free memory must be page-aligned");
+
+  const int npages = 10;
+  const int bytes = npages * 4096;
+
+  require(sbrk(bytes) != (char *)-1, "sbrk grow failed");
+  refresh();
+  uint64 after = info->freemem;
+  require(after <= before - (uint64)bytes,
+          "Free memory did not decrease by at least allocated bytes");
+
+  require(sbrk(-bytes) != (char *)-1, "sbrk shrink failed");
+  refresh();
+  uint64 restored = info->freemem;
+  require(restored == after + (uint64)bytes,
+          "Free memory did not increase by freed bytes");
+
+  printf("Before=%lu, After alloc=%lu, Restored=%lu bytes\n",
+         before, after, restored);
+  printf("Free memory checks completed\n");
 }
 
 void
@@ -614,6 +645,7 @@ main(void)
          (int)sizeof(struct sysinfo));
 
   test_basic();
+  test_freemem();
   test_open_dup_close();
   test_fork_wait();
   test_invalid_pointer();

@@ -766,6 +766,7 @@ systeminfo(uint64 addr)
     acquire(&proc[i].ofile_lock);
 
   file_snapshot(out);
+  out->freemem = freemem();
   for(int i = 0; i < out->nopenfiles; i++)
     file_slots[out->files[i].file_id] = i;
 
