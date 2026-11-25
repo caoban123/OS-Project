@@ -144,17 +144,25 @@ sys_pgaccess(void)
 
   struct proc *p = myproc();
   uint32 abits = 0;
+  pte_t *touched[PGACCESS_MAX];
+  int ntouched = 0;
 
   for(int i = 0; i < len; i++, va += PGSIZE){
     pte_t *pte = walk(p->pagetable, va, 0);
     if(pte != 0 && (*pte & PTE_V) && (*pte & PTE_U) && (*pte & PTE_A)){
       abits |= (1U << i);
-      *pte &= ~PTE_A;
+      touched[ntouched++] = pte;
     }
   }
 
   if(copyout(p->pagetable, mask_addr, (char *)&abits, sizeof(abits)) < 0)
     return -1;
+
+  for(int i = 0; i < ntouched; i++)
+    *touched[i] &= ~PTE_A;
+
+  if(ntouched > 0)
+    sfence_vma();
 
   return 0;
 }

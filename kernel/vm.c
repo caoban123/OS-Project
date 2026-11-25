@@ -495,9 +495,7 @@ vmprint_walk(pagetable_t pagetable, int level)
       continue;
 
     for(int d = 0; d <= level; d++){
-      if(d > 0)
-        printf(" ");
-      printf("..");
+      printf(" ..");
     }
 
     uint64 child = PTE2PA(pte);

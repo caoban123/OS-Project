@@ -93,6 +93,50 @@ pgaccess_invalid_test(char *buf)
 
   printf("pgaccess_invalid_test: OK\n");
 }
+static void
+pgaccess_edge_test(char *buf)
+{
+  unsigned int abits = 0xdeadbeefU;
+
+  if(pgaccess(buf, 32, &abits) < 0)
+    err("baseline pgaccess failed");
+
+  // 1. len == 0 should succeed, write 0 to mask, and keep existing PTE_A bits.
+  buf[PGSIZE * 4] = 0x11;
+  abits = 0xdeadbeefU;
+  if(pgaccess(buf, 0, &abits) < 0)
+    err("len == 0 should succeed");
+  if(abits != 0)
+    err("len == 0 should clear output mask to 0");
+
+  // 2. Failed copyout must not wipe PTE_A bits already set in hardware.
+  if(pgaccess(buf, 32, (void *)0x0) != -1)
+    err("invalid mask should fail");
+  if(pgaccess(buf, 32, &abits) < 0)
+    err("recovery pgaccess failed");
+  if(abits != (1U << 4)){
+    printf("pgaccess_edge_test: got 0x%x, expected 0x%x\n", abits, (1U << 4));
+    err("failed syscall should not lose PTE_A bits");
+  }
+
+  // 3. Unaligned base address should still check the containing pages.
+  char *unaligned = (char *)PGROUNDUP((uint64)buf) + 123;
+  unaligned[PGSIZE * 6] = 0x22;
+  if(pgaccess(unaligned, 8, &abits) < 0)
+    err("unaligned base pgaccess failed");
+  if(abits != (1U << 6))
+    err("unaligned base reported wrong page bit");
+
+  // 4. Unmapped pages below MAXVA should report 0 without crashing.
+  char *unmapped = sbrk(0) + 4 * PGSIZE;
+  abits = 0xffffffffU;
+  if(pgaccess(unmapped, 4, &abits) < 0)
+    err("unmapped range pgaccess failed");
+  if(abits != 0)
+    err("unmapped pages should have access bits = 0");
+
+  printf("pgaccess_edge_test: OK\n");
+}
 
 int
 main(int argc, char *argv[])
@@ -107,6 +151,7 @@ main(int argc, char *argv[])
   pgaccess_clear_test(buf);
   pgaccess_read_write_test(buf);
   pgaccess_invalid_test(buf);
+  pgaccess_edge_test(buf);
 
   free(buf);
   printf("pgtbltest: all tests passed!\n");
